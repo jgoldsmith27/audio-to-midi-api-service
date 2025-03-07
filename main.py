@@ -4,18 +4,41 @@ import tempfile
 import json
 import base64
 import logging
-import asyncio
-from typing import Dict, Any, List, Optional, Union
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field, HttpUrl
-import requests
-import numpy as np
+import sys
+import traceback
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up enhanced logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger("basic-pitch-service")
+
+# Capture uncaught exceptions
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = handle_exception
+
+logger.info("Starting up Basic Pitch service...")
+
+try:
+    from typing import Dict, Any, List, Optional, Union
+    from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.security import APIKeyHeader
+    from pydantic import BaseModel, Field, HttpUrl
+    import requests
+    import numpy as np
+    logger.info("Basic imports successful")
+except Exception as e:
+    logger.critical(f"Failed importing basic modules: {str(e)}")
+    logger.critical(traceback.format_exc())
+    raise
 
 # Initialize FastAPI app
 app = FastAPI(title="Basic Pitch Converter Service")
@@ -37,11 +60,18 @@ def get_basic_pitch():
     global basic_pitch_module
     if basic_pitch_module is None:
         try:
+            logger.info("Attempting to import basic_pitch module...")
             import basic_pitch
             basic_pitch_module = basic_pitch
-        except ImportError:
-            logger.error("Failed to import basic_pitch module")
-            raise HTTPException(status_code=500, detail="Basic Pitch module not available")
+            logger.info("Successfully imported basic_pitch module")
+        except ImportError as e:
+            logger.error(f"Failed to import basic_pitch module: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Basic Pitch module not available: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error importing basic_pitch: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Error loading Basic Pitch: {str(e)}")
     return basic_pitch_module
 
 # Security configuration
@@ -306,7 +336,7 @@ async def get_job_status(job_id: str, _: Any = Depends(get_api_key)):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "ok", "message": "Service is running"}
 
 # For direct running on Render
 if __name__ == "__main__":
