@@ -20,7 +20,7 @@ midiutil==1.2.1
 resampy==0.4.2
 
 # Basic Pitch dependencies
-basic-pitch==0.2.10
+basic-pitch==0.2.6
 tensorflow==2.13.0
 tensorflow-io==0.31.0
 
