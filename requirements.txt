@@ -9,7 +9,7 @@ gunicorn==21.2.0
 
 # Authentication dependencies
 cryptography==41.0.5
-httpx==0.24.1
+httpx==0.23.3
 
 # Audio processing dependencies
 numpy==1.23.5
