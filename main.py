@@ -7,6 +7,7 @@ import logging
 import sys
 import traceback
 import time
+import threading
 from typing import Dict, Any, List, Optional, Union
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +15,10 @@ from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 import requests
+
+# Set TensorFlow environment variables
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Better GPU memory management
 
 # Set up enhanced logging
 logging.basicConfig(
@@ -33,6 +38,30 @@ def handle_exception(exc_type, exc_value, exc_traceback):
 sys.excepthook = handle_exception
 
 logger.info("Starting up Basic Pitch service...")
+
+# Warm up TensorFlow and Basic Pitch in a background thread
+basic_pitch_loaded = False
+model_load_error = None
+
+def load_ml_libraries():
+    global basic_pitch_loaded, model_load_error
+    try:
+        logger.info("Pre-loading ML libraries in background thread...")
+        import numpy as np
+        # Preload just the necessary TensorFlow components without initializing models
+        import tensorflow as tf
+        tf.config.set_visible_devices([], 'GPU')  # Disable GPU to save memory
+        logger.info("TensorFlow imported successfully")
+        # Don't load basic_pitch yet - we'll do that on-demand
+        basic_pitch_loaded = True
+        logger.info("ML libraries pre-loaded successfully")
+    except Exception as e:
+        model_load_error = str(e)
+        logger.error(f"Error pre-loading ML libraries: {str(e)}")
+        logger.error(traceback.format_exc())
+
+# Start preloading in background thread
+threading.Thread(target=load_ml_libraries, daemon=True).start()
 
 # Initialize FastAPI app
 app = FastAPI(title="Basic Pitch Converter Service")
@@ -135,6 +164,17 @@ async def process_audio_task(conversion_id: str, audio_data: bytes, options: Con
         logger.info(f"Starting to process conversion: {conversion_id}")
         job_storage[conversion_id].progress = 0.2
         
+        # Check if we had errors pre-loading the ML libraries
+        if model_load_error:
+            logger.error(f"Cannot process due to ML library initialization error: {model_load_error}")
+            job_storage[conversion_id] = JobStatus(
+                jobId=conversion_id,
+                status="failed",
+                progress=0,
+                error=f"ML initialization error: {model_load_error}"
+            )
+            return
+            
         # Create a temporary file for the audio
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
             temp_file.write(audio_data)
@@ -145,12 +185,17 @@ async def process_audio_task(conversion_id: str, audio_data: bytes, options: Con
             # Update progress
             job_storage[conversion_id].progress = 0.3
             
-            # Only load TensorFlow/ML libraries when actually needed
-            logger.info("Attempting to import basic_pitch and numpy for processing")
+            # First, make sure numpy and tensorflow are imported - should be quick since they're preloaded
             import numpy as np
+            import tensorflow as tf
+            logger.info("NumPy and TensorFlow imported for processing")
+            
+            # Now import basic_pitch (should be faster since TensorFlow is already loaded)
+            logger.info("Importing basic_pitch for processing...")
             import basic_pitch
             from basic_pitch import ICASSP_2022_MODEL_PATH
             from basic_pitch.inference import predict
+            logger.info("Basic Pitch imported successfully")
             
             # Update progress
             job_storage[conversion_id].progress = 0.4
@@ -290,7 +335,13 @@ async def get_job_status(job_id: str, _: Any = Depends(get_api_key)):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "message": "Service is running", "time": time.time()}
+    return {
+        "status": "ok", 
+        "message": "Service is running", 
+        "time": time.time(),
+        "ml_libraries_loaded": basic_pitch_loaded,
+        "ml_load_error": model_load_error
+    }
 
 @app.get("/")
 async def root():
