@@ -11,18 +11,23 @@ import threading
 import concurrent.futures
 import asyncio
 from typing import Dict, Any, List, Optional, Union
+
+# Set TensorFlow environment variables before any imports
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Better GPU memory management
+# Explicitly disable CUDA/GPU for Render compatibility
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU only
+
+# Configure NumPy before TensorFlow imports
+import numpy as np
+
+# Import FastAPI components
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 import requests
-
-# Set TensorFlow environment variables
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Better GPU memory management
-# Explicitly disable CUDA/GPU for Render compatibility
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU only
 
 # Set up enhanced logging
 logging.basicConfig(
@@ -51,11 +56,21 @@ def load_ml_libraries():
     global basic_pitch_loaded, model_load_error
     try:
         logger.info("Pre-loading ML libraries in background thread...")
-        import numpy as np
         # Preload just the necessary TensorFlow components without initializing models
         import tensorflow as tf
         # Explicitly disable GPU for Render compatibility
         tf.config.set_visible_devices([], 'GPU')
+        
+        # Try to preload Basic Pitch model (similar to working code)
+        logger.info("Attempting to preload Basic Pitch model...")
+        try:
+            from basic_pitch.inference import predict, Model
+            from basic_pitch import ICASSP_2022_MODEL_PATH
+            # Don't initialize the full model yet to save memory
+            logger.info("Basic Pitch modules imported successfully")
+        except Exception as model_error:
+            logger.warning(f"Basic Pitch import warning (will retry later): {str(model_error)}")
+        
         logger.info("TensorFlow imported successfully")
         # Don't load basic_pitch yet - we'll do that on-demand
         basic_pitch_loaded = True
@@ -233,7 +248,6 @@ async def process_audio_task(conversion_id: str, audio_data: bytes, options: Con
                     limit_memory()
                     
                     # First, make sure numpy and tensorflow are imported - should be quick since they're preloaded
-                    import numpy as np
                     import tensorflow as tf
                     
                     logger.info("Starting TensorFlow configuration")
@@ -265,9 +279,9 @@ async def process_audio_task(conversion_id: str, audio_data: bytes, options: Con
                     # Now import basic_pitch (should be faster since TensorFlow is already loaded)
                     logger.info("Importing basic_pitch for processing...")
                     try:
-                        import basic_pitch
-                        from basic_pitch import ICASSP_2022_MODEL_PATH
                         from basic_pitch.inference import predict
+                        from basic_pitch import ICASSP_2022_MODEL_PATH
+                        import basic_pitch
                         logger.info("Basic Pitch imported successfully")
                     except Exception as import_error:
                         logger.error(f"Failed to import Basic Pitch: {str(import_error)}")
