@@ -1,7 +1,7 @@
 # Core dependencies
-fastapi==0.104.1
-uvicorn==0.23.2
-pydantic==2.4.2
+fastapi==0.95.2
+uvicorn==0.22.0
+pydantic==1.10.8
 requests==2.31.0
 python-multipart==0.0.6
 PyJWT==2.8.0
@@ -9,7 +9,7 @@ gunicorn==21.2.0
 
 # Authentication dependencies
 cryptography==41.0.5
-httpx==0.25.1
+httpx==0.24.1
 
 # Audio processing dependencies
 numpy==1.23.5
@@ -32,3 +32,6 @@ supabase==0.7.1
 
 # Add aiohttp for async HTTP requests (used in the working code)
 aiohttp==3.8.5
+
+# Explicitly pin typing-extensions to a version compatible with TensorFlow
+typing-extensions==4.5.0
