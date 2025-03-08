@@ -57,14 +57,28 @@ def load_ml_libraries():
     try:
         logger.info("Pre-loading ML libraries in background thread...")
         
-        # Import TensorFlow safely to avoid circular imports
+        # Import TensorFlow safely with fallback for older versions
         try:
-            # Import core TensorFlow first
-            import tensorflow.compat.v2 as tf_core
-            # Disable GPU
-            tf_core.config.set_visible_devices([], 'GPU')
-            # Then import the full module
+            # Try direct import first - simpler approach
+            logger.info("Importing TensorFlow directly")
             import tensorflow as tf
+            
+            # Disable GPU if available in this version
+            try:
+                logger.info("Disabling GPU with set_visible_devices if available")
+                tf.config.set_visible_devices([], 'GPU')
+            except AttributeError:
+                # Handle older TensorFlow versions
+                logger.info("set_visible_devices not available, trying alternate method")
+                try:
+                    # Try alternate method for older versions
+                    physical_devices = tf.config.experimental.list_physical_devices('GPU')
+                    if physical_devices:
+                        for device in physical_devices:
+                            tf.config.experimental.set_memory_growth(device, True)
+                except:
+                    logger.warning("Could not configure GPU settings, continuing anyway")
+            
             logger.info("TensorFlow imported successfully")
         except ImportError as e:
             logger.error(f"Error importing TensorFlow: {str(e)}")
@@ -257,15 +271,28 @@ async def process_audio_task(conversion_id: str, audio_data: bytes, options: Con
                     # Limit memory usage
                     limit_memory()
                     
-                    # Import TensorFlow in a way that avoids circular imports
+                    # Import TensorFlow with fallback for older versions
                     logger.info("Starting TensorFlow configuration")
                     try:
-                        # Import only the core TensorFlow module first
-                        import tensorflow.compat.v2 as tf_core
-                        # Explicitly disable GPU
-                        tf_core.config.set_visible_devices([], 'GPU')
-                        # Then import the full module
+                        # Direct import - simpler approach that should work with all versions
                         import tensorflow as tf
+                        
+                        # Disable GPU if available in this version
+                        try:
+                            logger.info("Disabling GPU with set_visible_devices if available")
+                            tf.config.set_visible_devices([], 'GPU')
+                        except AttributeError:
+                            # Handle older TensorFlow versions
+                            logger.info("set_visible_devices not available, trying alternate method")
+                            try:
+                                # Try alternate method for older versions
+                                physical_devices = tf.config.experimental.list_physical_devices('GPU')
+                                if physical_devices:
+                                    for device in physical_devices:
+                                        tf.config.experimental.set_memory_growth(device, True)
+                            except:
+                                logger.warning("Could not configure GPU settings, continuing anyway")
+                        
                         # Set logging level via environment variable instead
                         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # ERROR level
                         logger.info("TensorFlow imported and configured successfully")
@@ -310,8 +337,21 @@ async def process_audio_task(conversion_id: str, audio_data: bytes, options: Con
                     # Process with Basic Pitch - using a more minimal parameter set
                     try:
                         logger.info(f"Running Basic Pitch on file: {temp_file_path}")
-                        # Use a context manager for better resource management
-                        with tf.device('/CPU:0'):  # Force CPU usage explicitly
+                        # Try to use context manager but handle older TF versions
+                        try:
+                            with tf.device('/CPU:0'):  # Force CPU usage explicitly
+                                midi_data, notes, _ = predict(
+                                    temp_file_path,
+                                    ICASSP_2022_MODEL_PATH,
+                                    min_frequency=options.minFrequency,
+                                    max_frequency=options.maxFrequency,
+                                    onset_threshold=options.onsetThreshold,
+                                    frame_threshold=options.energyThreshold,
+                                    min_note_length=options.minNoteLength
+                                )
+                        except AttributeError:
+                            # Fallback for older TensorFlow that might not have device context manager
+                            logger.info("TensorFlow device context not available, running prediction directly")
                             midi_data, notes, _ = predict(
                                 temp_file_path,
                                 ICASSP_2022_MODEL_PATH,
