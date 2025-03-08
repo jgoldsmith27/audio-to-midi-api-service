@@ -74,7 +74,8 @@ def load_ml_libraries():
         # Try to preload Basic Pitch model (similar to working code)
         logger.info("Attempting to preload Basic Pitch model...")
         try:
-            from basic_pitch.inference import predict, Model
+            # In basic-pitch 0.2.6, there is no Model class
+            from basic_pitch.inference import predict
             from basic_pitch import ICASSP_2022_MODEL_PATH
             # Don't initialize the full model yet to save memory
             logger.info("Basic Pitch modules imported successfully")
@@ -285,11 +286,112 @@ async def process_audio_task(conversion_id: str, audio_data: bytes, options: Con
                         logger.error(traceback.format_exc())
                         return {"success": False, "error": f"Failed to load Basic Pitch: {str(import_error)}"}
                     
-                    # Remaining processing code...
-                    # ...
+                    # Check that the audio file exists and is readable
+                    if not os.path.exists(temp_file_path):
+                        logger.error(f"Audio file not found: {temp_file_path}")
+                        return {"success": False, "error": "Audio file not found"}
                     
-                    # This is a placeholder for the full implementation
-                    return {"success": True, "midi": "dummy_base64_data"}
+                    # Get file size
+                    file_size = os.path.getsize(temp_file_path)
+                    logger.info(f"Processing file size: {file_size/1024:.2f}KB")
+                    
+                    # Simplify options for more reliable processing
+                    simplified_options = {
+                        "min_frequency": options.minFrequency,
+                        "max_frequency": options.maxFrequency,
+                        "min_note_length": options.minNoteLength,
+                        "onset_threshold": options.onsetThreshold,
+                        "frame_threshold": options.energyThreshold,
+                        "melodia_trick": options.melodiaFilter
+                    }
+                    
+                    logger.info(f"Starting Basic Pitch prediction with options: {simplified_options}")
+                    
+                    # Process with Basic Pitch - using a more minimal parameter set
+                    try:
+                        logger.info(f"Running Basic Pitch on file: {temp_file_path}")
+                        # Use a context manager for better resource management
+                        with tf.device('/CPU:0'):  # Force CPU usage explicitly
+                            midi_data, notes, _ = predict(
+                                temp_file_path,
+                                ICASSP_2022_MODEL_PATH,
+                                min_frequency=options.minFrequency,
+                                max_frequency=options.maxFrequency,
+                                onset_threshold=options.onsetThreshold,
+                                frame_threshold=options.energyThreshold,
+                                min_note_length=options.minNoteLength
+                            )
+                        logger.info("Basic Pitch prediction completed successfully")
+                    except Exception as predict_error:
+                        logger.error(f"Error during Basic Pitch prediction: {str(predict_error)}")
+                        logger.error(traceback.format_exc())
+                        return {"success": False, "error": f"Prediction failed: {str(predict_error)}"}
+                    
+                    # Save MIDI to temporary file
+                    logger.info("Creating MIDI file from prediction results")
+                    midi_temp = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
+                    midi_temp.close()
+                    
+                    try:
+                        logger.info(f"Saving MIDI to temporary file: {midi_temp.name}")
+                        # Wrap in error handling with detailed logging
+                        try:
+                            # Print debug info about the midi_data and notes
+                            logger.info(f"MIDI data shape: {midi_data.shape if hasattr(midi_data, 'shape') else 'No shape attribute'}")
+                            logger.info(f"Notes data length: {len(notes) if notes else 'None'}")
+                            
+                            basic_pitch.save_midi(
+                                midi_data,
+                                notes,
+                                midi_temp.name,
+                                options.minFrequency,
+                                options.maxFrequency,
+                                options.multipleNotesPerFrame
+                            )
+                            logger.info("MIDI saved successfully")
+                        except TypeError as type_error:
+                            logger.error(f"Type error when saving MIDI: {str(type_error)}")
+                            logger.error(traceback.format_exc())
+                            raise Exception(f"MIDI format error: {str(type_error)}")
+                        except ValueError as val_error:
+                            logger.error(f"Value error when saving MIDI: {str(val_error)}")
+                            logger.error(traceback.format_exc())
+                            raise Exception(f"MIDI data error: {str(val_error)}")
+                        except Exception as inner_error:
+                            logger.error(f"Unexpected error saving MIDI: {str(inner_error)}")
+                            logger.error(traceback.format_exc())
+                            raise
+                    except Exception as e:
+                        logger.error(f"Error in saving MIDI: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        if os.path.exists(midi_temp.name):
+                            os.unlink(midi_temp.name)
+                        return {"success": False, "error": f"Error saving MIDI: {str(e)}"}
+                    
+                    # Read the MIDI file and encode to base64
+                    try:
+                        logger.info("Reading MIDI file and encoding to base64")
+                        with open(midi_temp.name, "rb") as midi_file:
+                            midi_bytes = midi_file.read()
+                            midi_base64 = base64.b64encode(midi_bytes).decode("utf-8")
+                        logger.info(f"MIDI encoded successfully, size: {len(midi_base64)} bytes")
+                    except Exception as encode_error:
+                        logger.error(f"Error encoding MIDI: {str(encode_error)}")
+                        logger.error(traceback.format_exc())
+                        if os.path.exists(midi_temp.name):
+                            os.unlink(midi_temp.name)
+                        return {"success": False, "error": f"Error encoding MIDI: {str(encode_error)}"}
+                    
+                    # Clean up temporary files
+                    logger.info(f"Cleaning up temporary MIDI file: {midi_temp.name}")
+                    if os.path.exists(midi_temp.name):
+                        os.unlink(midi_temp.name)
+                    
+                    logger.info("Processing completed successfully")
+                    return {
+                        "success": True,
+                        "midi": midi_base64
+                    }
                 except Exception as e:
                     logger.error(f"Error in processing thread: {str(e)}")
                     logger.error(traceback.format_exc())
