@@ -9,6 +9,7 @@ export TF_FORCE_GPU_ALLOW_GROWTH=${TF_FORCE_GPU_ALLOW_GROWTH:-true}
 export ALLOW_ANONYMOUS_ACCESS=${ALLOW_ANONYMOUS_ACCESS:-"true"}
 
 # Get the PORT from environment or use default
+# Render sets PORT automatically, so we need to use that
 PORT=${PORT:-8000}
 
 # Start with gunicorn with proper timeouts
