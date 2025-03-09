@@ -4,108 +4,18 @@ import tempfile
 import json
 import base64
 import logging
-import sys
-import traceback
-import time
-import threading
-import concurrent.futures
 import asyncio
 from typing import Dict, Any, List, Optional, Union
-
-# Set TensorFlow environment variables before any imports
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Better GPU memory management
-# Explicitly disable CUDA/GPU for Render compatibility
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU only
-
-# Configure NumPy before TensorFlow imports
-import numpy as np
-
-# Import FastAPI components
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 import requests
+import numpy as np
 
-# Set up enhanced logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("basic-pitch-service")
-
-# Capture uncaught exceptions
-def handle_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
-
-sys.excepthook = handle_exception
-
-logger.info("Starting up Basic Pitch service...")
-
-# Warm up TensorFlow and Basic Pitch in a background thread
-basic_pitch_loaded = False
-model_load_error = None
-
-def load_ml_libraries():
-    global basic_pitch_loaded, model_load_error
-    try:
-        logger.info("Pre-loading ML libraries in background thread...")
-        
-        # Import TensorFlow safely with fallback for older versions
-        try:
-            # Try direct import first - simpler approach
-            logger.info("Importing TensorFlow directly")
-            import tensorflow as tf
-            
-            # Disable GPU if available in this version
-            try:
-                logger.info("Disabling GPU with set_visible_devices if available")
-                tf.config.set_visible_devices([], 'GPU')
-            except AttributeError:
-                # Handle older TensorFlow versions
-                logger.info("set_visible_devices not available, trying alternate method")
-                try:
-                    # Try alternate method for older versions
-                    physical_devices = tf.config.experimental.list_physical_devices('GPU')
-                    if physical_devices:
-                        for device in physical_devices:
-                            tf.config.experimental.set_memory_growth(device, True)
-                except:
-                    logger.warning("Could not configure GPU settings, continuing anyway")
-            
-            logger.info("TensorFlow imported successfully")
-        except ImportError as e:
-            logger.error(f"Error importing TensorFlow: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise e
-        
-        # Try to preload Basic Pitch model (similar to working code)
-        logger.info("Attempting to preload Basic Pitch model...")
-        try:
-            # In basic-pitch 0.2.6, there is no Model class
-            from basic_pitch.inference import predict
-            from basic_pitch import ICASSP_2022_MODEL_PATH
-            # Don't initialize the full model yet to save memory
-            logger.info("Basic Pitch modules imported successfully")
-        except Exception as model_error:
-            logger.warning(f"Basic Pitch import warning (will retry later): {str(model_error)}")
-        
-        # Don't load basic_pitch yet - we'll do that on-demand
-        basic_pitch_loaded = True
-        logger.info("ML libraries pre-loaded successfully")
-    except Exception as e:
-        model_load_error = str(e)
-        logger.error(f"Error pre-loading ML libraries: {str(e)}")
-        logger.error(traceback.format_exc())
-
-# Start preloading in background thread
-threading.Thread(target=load_ml_libraries, daemon=True).start()
 
 # Initialize FastAPI app
 app = FastAPI(title="Basic Pitch Converter Service")
@@ -119,14 +29,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# For Vercel deployment - import basic-pitch only when needed
+# This helps reduce cold start time
+basic_pitch_module = None
+
+def get_basic_pitch():
+    global basic_pitch_module
+    if basic_pitch_module is None:
+        try:
+            import basic_pitch
+            basic_pitch_module = basic_pitch
+        except ImportError:
+            logger.error("Failed to import basic_pitch module")
+            raise HTTPException(status_code=500, detail="Basic Pitch module not available")
+    return basic_pitch_module
+
 # Security configuration
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-# In-memory job storage
-job_storage = {}
+# Job tracking
+jobs = {}
 
-# Model Classes
+# Model classes
 class OutputFormat(BaseModel):
     midi: bool = True
     csv: bool = False
@@ -181,325 +106,139 @@ async def get_api_key(api_key_header: str = Header(None, alias=API_KEY_NAME), re
         detail="Authentication required",
     )
 
-# Add file size limit (10MB)
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-
-# Helper function to download file from URL with size check
+# Helper function to download file from URL
 async def download_file(url: str) -> bytes:
     try:
         logger.info(f"Downloading file from URL: {url}")
-        
-        # Use streaming to check file size before downloading the whole file
-        with requests.get(url, stream=True, timeout=30) as response:
-            response.raise_for_status()
-            
-            # Check Content-Length if available
-            content_length = response.headers.get('Content-Length')
-            if content_length and int(content_length) > MAX_FILE_SIZE:
-                logger.error(f"File too large: {int(content_length) / (1024 * 1024):.2f}MB exceeds limit of 10MB")
-                raise HTTPException(status_code=413, detail=f"File too large (max 10MB)")
-            
-            # Download the file in chunks, checking size as we go
-            chunks = []
-            total_size = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                chunks.append(chunk)
-                total_size += len(chunk)
-                if total_size > MAX_FILE_SIZE:
-                    logger.error(f"File too large: {total_size / (1024 * 1024):.2f}MB exceeds limit of 10MB")
-                    raise HTTPException(status_code=413, detail=f"File too large (max 10MB)")
-            
-            file_data = b''.join(chunks)
-            logger.info(f"File downloaded successfully ({len(file_data)} bytes)")
-            return file_data
-    except requests.RequestException as e:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        logger.info(f"File downloaded successfully ({len(response.content)} bytes)")
+        return response.content
+    except Exception as e:
         logger.error(f"Error downloading file: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Failed to download audio file: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error downloading file: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Could not download file: {str(e)}")
 
-# Add a resource limiter to prevent out of memory errors
-def limit_memory():
-    try:
-        import resource
-        # Limit virtual memory to 5GB (adjust based on Render's limits)
-        resource.setrlimit(resource.RLIMIT_AS, (5 * 1024 * 1024 * 1024, -1))
-        logger.info("Set memory limit to 5GB")
-    except Exception as e:
-        logger.warning(f"Failed to set memory limit: {str(e)}")
-
-# Actual processing function - runs in background
+# Process audio in a background task
 async def process_audio_task(conversion_id: str, audio_data: bytes, options: ConversionOptions):
-    try:
-        # Update job status to processing
-        job_storage[conversion_id] = JobStatus(
-            jobId=conversion_id,
-            status="processing",
-            progress=0.1
-        )
-        
-        # Simulate processing without loading ML libraries yet
-        logger.info(f"Starting to process conversion: {conversion_id}")
-        job_storage[conversion_id].progress = 0.2
-        
-        # Check if we had errors pre-loading the ML libraries
-        if model_load_error:
-            logger.error(f"Cannot process due to ML library initialization error: {model_load_error}")
-            job_storage[conversion_id] = JobStatus(
-                jobId=conversion_id,
-                status="failed",
-                progress=0,
-                error=f"ML initialization error: {model_load_error}"
-            )
-            return
-            
-        # Create a temporary file for the audio
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
-            temp_file.write(audio_data)
-            temp_file_path = temp_file.name
-            logger.info(f"Audio saved to temporary file: {temp_file_path}")
-            
-        try:
-            # Update progress
-            job_storage[conversion_id].progress = 0.3
-            
-            # Apply resource limits within a separate thread to avoid affecting main app
-            def process_with_limits():
-                try:
-                    # Limit memory usage
-                    limit_memory()
-                    
-                    # Import TensorFlow with fallback for older versions
-                    logger.info("Starting TensorFlow configuration")
-                    try:
-                        # Direct import - simpler approach that should work with all versions
-                        import tensorflow as tf
-                        
-                        # Disable GPU if available in this version
-                        try:
-                            logger.info("Disabling GPU with set_visible_devices if available")
-                            tf.config.set_visible_devices([], 'GPU')
-                        except AttributeError:
-                            # Handle older TensorFlow versions
-                            logger.info("set_visible_devices not available, trying alternate method")
-                            try:
-                                # Try alternate method for older versions
-                                physical_devices = tf.config.experimental.list_physical_devices('GPU')
-                                if physical_devices:
-                                    for device in physical_devices:
-                                        tf.config.experimental.set_memory_growth(device, True)
-                            except:
-                                logger.warning("Could not configure GPU settings, continuing anyway")
-                        
-                        # Set logging level via environment variable instead
-                        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # ERROR level
-                        logger.info("TensorFlow imported and configured successfully")
-                    except ImportError as e:
-                        logger.error(f"Error importing TensorFlow: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        return {"success": False, "error": f"Failed to import TensorFlow: {str(e)}"}
-                    
-                    # Now import basic_pitch (should be faster since TensorFlow is already loaded)
-                    logger.info("Importing basic_pitch for processing...")
-                    try:
-                        from basic_pitch.inference import predict
-                        from basic_pitch import ICASSP_2022_MODEL_PATH
-                        import basic_pitch
-                        logger.info("Basic Pitch imported successfully")
-                    except Exception as import_error:
-                        logger.error(f"Failed to import Basic Pitch: {str(import_error)}")
-                        logger.error(traceback.format_exc())
-                        return {"success": False, "error": f"Failed to load Basic Pitch: {str(import_error)}"}
-                    
-                    # Check that the audio file exists and is readable
-                    if not os.path.exists(temp_file_path):
-                        logger.error(f"Audio file not found: {temp_file_path}")
-                        return {"success": False, "error": "Audio file not found"}
-                    
-                    # Get file size
-                    file_size = os.path.getsize(temp_file_path)
-                    logger.info(f"Processing file size: {file_size/1024:.2f}KB")
-                    
-                    # Simplify options for more reliable processing
-                    simplified_options = {
-                        "min_frequency": options.minFrequency,
-                        "max_frequency": options.maxFrequency,
-                        "min_note_length": options.minNoteLength,
-                        "onset_threshold": options.onsetThreshold,
-                        "frame_threshold": options.energyThreshold,
-                        "melodia_trick": options.melodiaFilter
-                    }
-                    
-                    logger.info(f"Starting Basic Pitch prediction with options: {simplified_options}")
-                    
-                    # Process with Basic Pitch - using a more minimal parameter set
-                    try:
-                        logger.info(f"Running Basic Pitch on file: {temp_file_path}")
-                        # Try to use context manager but handle older TF versions
-                        try:
-                            with tf.device('/CPU:0'):  # Force CPU usage explicitly
-                                midi_data, notes, _ = predict(
-                                    temp_file_path,
-                                    ICASSP_2022_MODEL_PATH,
-                                    min_frequency=options.minFrequency,
-                                    max_frequency=options.maxFrequency,
-                                    onset_threshold=options.onsetThreshold,
-                                    frame_threshold=options.energyThreshold,
-                                    min_note_length=options.minNoteLength
-                                )
-                        except AttributeError:
-                            # Fallback for older TensorFlow that might not have device context manager
-                            logger.info("TensorFlow device context not available, running prediction directly")
-                            midi_data, notes, _ = predict(
-                                temp_file_path,
-                                ICASSP_2022_MODEL_PATH,
-                                min_frequency=options.minFrequency,
-                                max_frequency=options.maxFrequency,
-                                onset_threshold=options.onsetThreshold,
-                                frame_threshold=options.energyThreshold,
-                                min_note_length=options.minNoteLength
-                            )
-                        logger.info("Basic Pitch prediction completed successfully")
-                    except Exception as predict_error:
-                        logger.error(f"Error during Basic Pitch prediction: {str(predict_error)}")
-                        logger.error(traceback.format_exc())
-                        return {"success": False, "error": f"Prediction failed: {str(predict_error)}"}
-                    
-                    # Save MIDI to temporary file
-                    logger.info("Creating MIDI file from prediction results")
-                    midi_temp = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
-                    midi_temp.close()
-                    
-                    try:
-                        logger.info(f"Saving MIDI to temporary file: {midi_temp.name}")
-                        # Wrap in error handling with detailed logging
-                        try:
-                            # Print debug info about the midi_data and notes
-                            logger.info(f"MIDI data shape: {midi_data.shape if hasattr(midi_data, 'shape') else 'No shape attribute'}")
-                            logger.info(f"Notes data length: {len(notes) if notes else 'None'}")
-                            
-                            basic_pitch.save_midi(
-                                midi_data,
-                                notes,
-                                midi_temp.name,
-                                options.minFrequency,
-                                options.maxFrequency,
-                                options.multipleNotesPerFrame
-                            )
-                            logger.info("MIDI saved successfully")
-                        except TypeError as type_error:
-                            logger.error(f"Type error when saving MIDI: {str(type_error)}")
-                            logger.error(traceback.format_exc())
-                            raise Exception(f"MIDI format error: {str(type_error)}")
-                        except ValueError as val_error:
-                            logger.error(f"Value error when saving MIDI: {str(val_error)}")
-                            logger.error(traceback.format_exc())
-                            raise Exception(f"MIDI data error: {str(val_error)}")
-                        except Exception as inner_error:
-                            logger.error(f"Unexpected error saving MIDI: {str(inner_error)}")
-                            logger.error(traceback.format_exc())
-                            raise
-                    except Exception as e:
-                        logger.error(f"Error in saving MIDI: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        if os.path.exists(midi_temp.name):
-                            os.unlink(midi_temp.name)
-                        return {"success": False, "error": f"Error saving MIDI: {str(e)}"}
-                    
-                    # Read the MIDI file and encode to base64
-                    try:
-                        logger.info("Reading MIDI file and encoding to base64")
-                        with open(midi_temp.name, "rb") as midi_file:
-                            midi_bytes = midi_file.read()
-                            midi_base64 = base64.b64encode(midi_bytes).decode("utf-8")
-                        logger.info(f"MIDI encoded successfully, size: {len(midi_base64)} bytes")
-                    except Exception as encode_error:
-                        logger.error(f"Error encoding MIDI: {str(encode_error)}")
-                        logger.error(traceback.format_exc())
-                        if os.path.exists(midi_temp.name):
-                            os.unlink(midi_temp.name)
-                        return {"success": False, "error": f"Error encoding MIDI: {str(encode_error)}"}
-                    
-                    # Clean up temporary files
-                    logger.info(f"Cleaning up temporary MIDI file: {midi_temp.name}")
-                    if os.path.exists(midi_temp.name):
-                        os.unlink(midi_temp.name)
-                    
-                    logger.info("Processing completed successfully")
-                    return {
-                        "success": True,
-                        "midi": midi_base64
-                    }
-                except Exception as e:
-                    logger.error(f"Error in processing thread: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    return {
-                        "success": False,
-                        "error": str(e)
-                    }
-            
-            # Run processing in a thread with better error handling
-            logger.info("Waiting for processing to complete (timeout: 8 minutes)")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(process_with_limits)
-                try:
-                    result = future.result(timeout=480)  # 8 minute timeout
-                    
-                    # Handle the processing result
-                    if result and isinstance(result, dict) and "success" in result:
-                        if result["success"]:
-                            # Mark job as completed with result
-                            job_storage[conversion_id] = JobStatus(
-                                jobId=conversion_id,
-                                status="completed",
-                                progress=1.0,
-                                result={"midi": result["midi"]}
-                            )
-                            logger.info(f"Conversion {conversion_id} completed successfully")
-                        else:
-                            # Mark job as failed
-                            job_storage[conversion_id] = JobStatus(
-                                jobId=conversion_id,
-                                status="failed",
-                                progress=0,
-                                error=result.get("error", "Unknown conversion error")
-                            )
-                            logger.error(f"Conversion {conversion_id} failed: {result.get('error', 'Unknown error')}")
-                    else:
-                        logger.error(f"Conversion {conversion_id} failed: Invalid result format")
-                        job_storage[conversion_id] = JobStatus(
-                            jobId=conversion_id,
-                            status="failed",
-                            progress=0,
-                            error="Invalid result format from processing thread"
-                        )
-                except concurrent.futures.TimeoutError:
-                    logger.error(f"Conversion {conversion_id} timed out after 8 minutes")
-                    job_storage[conversion_id] = JobStatus(
-                        jobId=conversion_id,
-                        status="failed",
-                        progress=0,
-                        error="Processing timed out after 8 minutes. Try a shorter audio file."
-                    )
-                    # Try to cancel the future to free resources
-                    future.cancel()
-        except Exception as e:
-            logger.error(f"Error in processing thread management: {str(e)}")
-            logger.error(traceback.format_exc())
-            job_storage[conversion_id].status = "failed"
-            job_storage[conversion_id].error = f"Thread execution error: {str(e)}"
+    job_id = conversion_id
+    jobs[job_id] = {"status": "processing", "progress": 0}
     
+    try:
+        # Save audio data to a temporary file
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+            temp_audio.write(audio_data)
+            audio_path = temp_audio.name
+        
+        # Create output directory
+        output_dir = tempfile.mkdtemp()
+        
+        # Update job status
+        jobs[job_id]["progress"] = 10
+        
+        try:
+            # Get the basic_pitch module using our lazy-loading function
+            basic_pitch = get_basic_pitch()
+            from basic_pitch.inference import predict_and_save, predict
+            
+            # Update job status
+            jobs[job_id]["progress"] = 20
+            
+            # Determine outputs to save
+            save_midi = options.outputFormat.midi
+            save_notes = options.outputFormat.csv
+            save_model_outputs = options.outputFormat.npz
+            sonify_midi = options.outputFormat.wav
+            
+            # Process in chunks for large files
+            max_audio_length = 600  # 10 minutes
+            
+            # Normalize Python parameters from JS camelCase
+            basic_pitch_params = {
+                "minimum_frequency": options.minFrequency,
+                "maximum_frequency": options.maxFrequency,
+                "min_note_length": options.minNoteLength,
+                "energy_threshold": options.energyThreshold,
+                "onset_threshold": options.onsetThreshold,
+                "melodia_trick": options.melodiaFilter,
+                "combine_notes_with_same_pitch": options.combineNotes,
+                "inference_onset": options.inferOnsets,
+                "multiple_pitch_bends": options.multipleNotesPerFrame
+            }
+            
+            # Update job status
+            jobs[job_id]["progress"] = 30
+            
+            # Call basic-pitch
+            logger.info(f"Processing audio with basic-pitch: {audio_path}")
+            logger.info(f"Basic Pitch parameters: {basic_pitch_params}")
+            
+            # Start the prediction process
+            model_output, midi_data, note_events = predict(
+                audio_path,
+                **basic_pitch_params
+            )
+            
+            # Update job status
+            jobs[job_id]["progress"] = 70
+            
+            # Save files if requested
+            output_file_base = os.path.join(output_dir, f"basic_pitch_{conversion_id}")
+            
+            # Get the MIDI data as bytes
+            midi_bytes = io.BytesIO()
+            midi_data.save(midi_bytes)
+            midi_bytes.seek(0)
+            midi_data_bytes = midi_bytes.read()
+            
+            # Convert MIDI data to base64
+            midi_base64 = base64.b64encode(midi_data_bytes).decode('utf-8')
+            
+            # Convert note events to serializable format
+            note_events_serializable = []
+            for note in note_events:
+                note_events_serializable.append({
+                    "pitch": int(note.pitch),
+                    "start_time": float(note.start_time),
+                    "end_time": float(note.end_time),
+                    "velocity": int(note.velocity),
+                    "instrument": int(note.instrument) if hasattr(note, 'instrument') else 0,
+                    "channel": int(note.channel) if hasattr(note, 'channel') else 0
+                })
+            
+            # Update job status
+            jobs[job_id]["progress"] = 90
+            
+            # Clean up temporary files
+            os.unlink(audio_path)
+            
+            # Update job status with results
+            jobs[job_id] = {
+                "status": "completed",
+                "progress": 100,
+                "result": {
+                    "success": True,
+                    "midiData": midi_base64,
+                    "noteEvents": note_events_serializable,
+                    "conversionId": conversion_id
+                }
+            }
+            
+            logger.info(f"Conversion completed successfully for job {job_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in basic-pitch processing: {str(e)}")
+            jobs[job_id] = {
+                "status": "failed",
+                "progress": 0,
+                "error": str(e)
+            }
     except Exception as e:
-        logger.error(f"Error in task: {str(e)}")
-        logger.error(traceback.format_exc())
-        job_storage[conversion_id] = JobStatus(
-            jobId=conversion_id,
-            status="failed",
-            progress=0,
-            error=f"Task error: {str(e)}"
-        )
+        logger.error(f"Error in background task: {str(e)}")
+        jobs[job_id] = {
+            "status": "failed",
+            "progress": 0,
+            "error": str(e)
+        }
 
 # API endpoints
 @app.post("/convert", response_model=Dict[str, Any])
@@ -509,119 +248,70 @@ async def convert_audio(
     _: Any = Depends(get_api_key)
 ):
     try:
-        conversion_id = request.conversionId
-        logger.info(f"Processing conversion request for {conversion_id}")
+        # Download the audio file
+        logger.info(f"Processing conversion request for {request.conversionId}")
+        audio_data = await download_file(request.audioUrl)
         
-        # Validate audio URL
-        if not request.audioUrl:
-            raise HTTPException(status_code=400, detail="Audio URL is required")
-            
-        # Basic validation of URL format
-        if not request.audioUrl.startswith(('http://', 'https://')):
-            raise HTTPException(status_code=400, detail="Invalid audio URL format")
+        # Start background processing
+        job_id = request.conversionId
+        background_tasks.add_task(
+            process_audio_task,
+            request.conversionId,
+            audio_data,
+            request.options
+        )
         
-        # Check if job already exists
-        if conversion_id in job_storage:
-            existing_job = job_storage[conversion_id]
-            logger.info(f"Job already exists with status: {existing_job.status}")
-            return {"jobId": conversion_id, "status": existing_job.status}
+        # Initialize job status
+        jobs[job_id] = {"status": "pending", "progress": 0}
         
-        try:
-            # Download the audio file with timeout and size limits
-            audio_data = await download_file(request.audioUrl)
-            
-            # Simple validation that it's actually audio data
-            if len(audio_data) < 100:  # Extremely small files are likely not valid audio
-                raise HTTPException(status_code=400, detail="Invalid audio file (too small)")
-                
-            # Create a new job
-            job_storage[conversion_id] = JobStatus(
-                jobId=conversion_id,
-                status="pending",
-                progress=0
-            )
-            
-            # Start the conversion task in the background
-            background_tasks.add_task(process_audio_task, conversion_id, audio_data, request.options)
-            logger.info(f"Conversion job {conversion_id} started in background")
-            
-            # Return the job ID
-            return {"jobId": conversion_id, "status": "pending"}
-        except HTTPException:
-            # Re-raise HTTP exceptions without modification
-            raise
-        except Exception as e:
-            logger.error(f"Error preparing conversion: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=f"Error preparing conversion: {str(e)}")
-    
+        # Return job ID for client to check status
+        logger.info(f"Conversion job {job_id} started in background")
+        return {
+            "success": True,
+            "status": "pending",
+            "jobId": job_id,
+            "message": "Conversion started in background"
+        }
     except Exception as e:
-        logger.error(f"Error in /convert endpoint: {str(e)}")
-        logger.error(traceback.format_exc())
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error starting conversion: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.get("/job/{job_id}", response_model=Dict[str, Any])
 async def get_job_status(job_id: str, _: Any = Depends(get_api_key)):
-    if job_id not in job_storage:
-        # Return a specific format that matches what the frontend expects
-        return {
-            "status": "not_found",
-            "jobId": job_id,
-            "error": "Job not found. It may have expired or was never created."
-        }
+    if job_id not in jobs:
+        logger.warning(f"Job not found: {job_id}")
+        raise HTTPException(status_code=404, detail="Job not found")
     
-    job = job_storage[job_id]
-    logger.info(f"Retrieved job status for {job_id}: {job.status}")
+    job_status = jobs[job_id]
+    logger.info(f"Retrieved job status for {job_id}: {job_status['status']}")
     
-    # For completed jobs, schedule cleanup after some time
-    if job.status == "completed" or job.status == "failed":
-        # Create a task to clean up the job after some time
-        async def cleanup_job(job_id):
-            try:
-                await asyncio.sleep(3600)  # Clean up after 1 hour
-                if job_id in job_storage:
-                    logger.info(f"Cleaning up completed job {job_id}")
-                    del job_storage[job_id]
-            except Exception as e:
-                logger.error(f"Error in cleanup task: {str(e)}")
+    # Clean up completed jobs after they're retrieved
+    if job_status["status"] in ["completed", "failed"]:
+        # Keep result but mark for cleanup
+        job_status["cleanup"] = True
         
-        # Schedule the cleanup
-        asyncio.create_task(cleanup_job(job_id))
-    
-    # Convert job status to dict with better error messages
-    result = job.dict()
-    
-    # Add debug info for errors to help diagnose issues
-    if job.status == "failed" and job.error:
-        result["debug_info"] = {
-            "error_type": type(job.error).__name__ if isinstance(job.error, Exception) else "str",
-            "last_recorded_progress": job.progress
-        }
+        # Schedule cleanup
+        async def cleanup_job():
+            await asyncio.sleep(300)  # Wait 5 minutes
+            if job_id in jobs and jobs[job_id].get("cleanup"):
+                del jobs[job_id]
+                logger.info(f"Cleaned up job {job_id}")
         
-        # Make sure error is a string
-        if not isinstance(result["error"], str):
-            result["error"] = str(result["error"])
-            
-    return result
+        asyncio.create_task(cleanup_job())
+    
+    return job_status
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "ok", 
-        "message": "Service is running", 
-        "time": time.time(),
-        "ml_libraries_loaded": basic_pitch_loaded,
-        "ml_load_error": model_load_error
-    }
+    return {"status": "healthy"}
 
-@app.get("/")
-async def root():
-    return {"message": "Basic Pitch Converter API", "status": "ok", "docs": "/docs"}
-
-# For direct running on Render
+# Main entry point
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    logger.info(f"Starting Basic Pitch service")
+    logger.info(f"Anonymous access: {os.environ.get('ALLOW_ANONYMOUS_ACCESS', 'false')}")
+    logger.info(f"API key set: {bool(API_KEY)}")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

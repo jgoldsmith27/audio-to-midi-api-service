@@ -4,7 +4,7 @@ services:
     env: python
     plan: standard
     buildCommand: pip install -r requirements.txt
-    startCommand: bash start.sh
+    startCommand: ./start.sh
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.0
@@ -16,23 +16,11 @@ services:
         value: "true"
       - key: TF_CPP_MIN_LOG_LEVEL
         value: "2"
-      - key: CUDA_VISIBLE_DEVICES
-        value: "-1"
       - key: TF_FORCE_GPU_ALLOW_GROWTH
         value: "true"
-      - key: TF_INTRA_OP_PARALLELISM_THREADS
-        value: "2"
-      - key: TF_INTER_OP_PARALLELISM_THREADS
-        value: "1"
-      - key: OMP_NUM_THREADS
-        value: "2"
     healthCheckPath: /health
     autoDeploy: false
     scaling:
       minInstances: 1
       maxInstances: 1
-      targetMemoryPercent: 80
-    disk:
-      name: audio-cache
-      mountPath: /tmp
-      sizeGB: 1 
+      targetMemoryPercent: 90 
