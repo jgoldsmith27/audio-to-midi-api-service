@@ -1,0 +1,15 @@
+version: '3'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - SUPABASE_URL=https://gshaarazegavljkgqgec.supabase.co
+      - SUPABASE_JWT_SECRET=+VCOppzcjBkQnpX29k7aflWpQl388Ju9wfI0ji/1FmW2nIjv7vgFte0tUmTZko41BOkmTkKuU6fv0Z3h21fUAA==
+      - ALLOW_ANONYMOUS_ACCESS=false
+      - ALLOW_INTERNAL_NETWORK=false
+    volumes:
+      - ./:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload 

@@ -1,25 +1,21 @@
 services:
   - type: web
     name: audio-to-midi-api
-    env: python
+    env: docker
     plan: standard
-    buildCommand: pip install -r requirements.txt
-    startCommand: ./start.sh
+    branch: main
+    dockerfilePath: ./Dockerfile
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.10.0
+      - key: SUPABASE_URL
+        value: https://gshaarazegavljkgqgec.supabase.co
+      - key: SUPABASE_JWT_SECRET
+        sync: false
       - key: ALLOW_ANONYMOUS_ACCESS
-        value: "true"
-      - key: MALLOC_ARENA_MAX
-        value: "2"
-      - key: PYTHONUNBUFFERED
-        value: "true"
-      - key: TF_CPP_MIN_LOG_LEVEL
-        value: "2"
-      - key: TF_FORCE_GPU_ALLOW_GROWTH
-        value: "true"
+        value: "false"
+      - key: ALLOW_INTERNAL_NETWORK
+        value: "false"
     healthCheckPath: /health
-    autoDeploy: false
+    autoDeploy: true
     scaling:
       minInstances: 1
       maxInstances: 1
