@@ -80,7 +80,7 @@ class Predictor(BasePredictor):
             # Create temp directory for outputs
             with tempfile.TemporaryDirectory() as temp_dir:
                 # Convert audio to MIDI
-                model_output, audio_features = basic_pitch_predict(
+                model_output, midi_data, note_events = basic_pitch_predict(
                     audio_path=str(audio),
                     model_or_model_path=ICASSP_2022_MODEL_PATH,
                     onset_threshold=onset_threshold,
@@ -95,20 +95,9 @@ class Predictor(BasePredictor):
                 # Path for the output MIDI file
                 output_path = os.path.join(temp_dir, "output.mid")
                 
-                # Write MIDI file
-                note_events_to_midi(
-                    pitch_outputs=model_output,
-                    onset_outputs=audio_features["onset"],
-                    frame_rate=audio_features["frame_rate"],
-                    output_path=output_path,
-                    min_note_length=min_note_length,
-                    min_frequency=min_frequency,
-                    max_frequency=max_frequency,
-                    melodia_trick=melodia_filter,
-                    combine_notes=combine_notes,
-                    infer_onsets=infer_onsets,
-                    multiple_notes_per_frame=multiple_notes_per_frame
-                )
+                # No need to generate MIDI from audio_features - we already have the MIDI data
+                # Just save the midi_data we received from basic_pitch_predict
+                midi_data.write(output_path)
                 
                 # Create a copy of the file in a new Path location that Replicate can access
                 final_output = Path(os.path.join(TMP_DIR, "output.mid"))
