@@ -1,0 +1,35 @@
+version: '3'
+
+services:
+  api:
+    build: .
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      - ALLOW_ANONYMOUS_ACCESS=${ALLOW_ANONYMOUS_ACCESS:-false}
+      - ALLOW_INTERNAL_NETWORK=${ALLOW_INTERNAL_NETWORK:-false}
+      - MAX_AUDIO_SIZE_MB=${MAX_AUDIO_SIZE_MB:-10}
+      - MAX_CONVERSION_TIME_SECONDS=${MAX_CONVERSION_TIME_SECONDS:-300}
+      - CLEANUP_COMPLETED_JOBS_AFTER_SECONDS=${CLEANUP_COMPLETED_JOBS_AFTER_SECONDS:-3600}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      - TF_CPP_MIN_LOG_LEVEL=2
+    volumes:
+      - tmp_data:/tmp  # Persisting temporary data
+    command: gunicorn -k uvicorn.workers.UvicornWorker --workers 1 --threads 8 --timeout 600 --bind 0.0.0.0:8000 main:app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+volumes:
+  tmp_data:  # Named volume for temporary data 
